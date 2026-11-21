@@ -678,7 +678,7 @@ def store_graph_in_neo4j(document_id: str, entities: list[dict], relationships: 
 
         session.run(
 
-            "MATCH (n:Entity {document_id*:* $document_id}) DETACH DELETE n",
+            "MATCH (n:Entity {document_id: $document_id}) DETACH DELETE n",
 
             document_id=document_id,
 
@@ -690,7 +690,7 @@ def store_graph_in_neo4j(document_id: str, entities: list[dict], relationships: 
 
                 """
 
-                MERGE (e:Entity {name*:* $name, document_id: $document_id})
+                MERGE (e:Entity {name: $name, document_id: $document_id})
 
                 SET e.type = $type
 
@@ -710,11 +710,11 @@ def store_graph_in_neo4j(document_id: str, entities: list[dict], relationships: 
 
                 """
 
-                MATCH (a:Entity {name*:* $source, document_id: $document_id})
+                MATCH (a:Entity {name: $source, document_id: $document_id})
 
-                MATCH (b:Entity {name*:* $target, document_id: $document_id})
+                MATCH (b:Entity {name: $target, document_id: $document_id})
 
-                MERGE (a)-[r:RELATED_TO {type*:* $type, document_id: $document_id}]->(b)
+                MERGE (a)-[r:RELATED_TO {type: $type, document_id: $document_id}]->(b)
 
                 SET r.evidence = $evidence
 
@@ -1014,7 +1014,7 @@ def delete_document(document_id: str):
 
                 session.run(
 
-                    "MATCH (n:Entity {document_id*:* $document_id}) DETACH DELETE n",
+                    "MATCH (n:Entity {document_id: $document_id}) DETACH DELETE n",
 
                     document_id=document_id,
 
