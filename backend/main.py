@@ -563,106 +563,93 @@ def extract_entities(text: str) -> list[dict]:
 
 
 def extract_relationships(text: str, entities: list[dict]) -> list[dict]:
+    """
+    Extract simple, evidence-backed links between entities.
 
-    """Small, intentionally rule-based relationship extractor."""
-
+    This project uses a lightweight rule-based extractor rather than an
+    open-domain relation extraction model. Entities mentioned together in
+    the same sentence/paragraph or nearby text are linked as RELATED_TO.
+    """
     relationships = []
+    entity_names = [entity["name"] for entity in entities if entity.get("name")]
 
-    entity_names = [entity["name"] for entity in entities]
-
-
+    # Keep a set so repeated mentions do not create duplicate Neo4j edges.
+    seen = set()
 
     def add(source, target, relation, evidence):
+        if not source or not target or source == target:
+            return
+        if source not in entity_names or target not in entity_names:
+            return
 
-        if source in entity_names and target in entity_names:
+        # Use a stable key regardless of which entity was encountered first.
+        pair = tuple(sorted((source, target))) + (relation,)
+        if pair in seen:
+            return
+        seen.add(pair)
+        relationships.append({
+            "source": source,
+            "target": target,
+            "type": relation,
+            "evidence": re.sub(r"\\s+", " ", evidence).strip()[:500],
+        })
 
-            item = {
-
-                "source": source,
-
-                "target": target,
-
-                "type": relation,
-
-                "evidence": evidence[:500],
-
-            }
-
-            if item not in relationships:
-
-                relationships.append(item)
-
-
-
-    patterns = [
-
-        (r"(.{0,100})RiverWatch(.{0,180})", "RiverWatch", "RELATED_TO"),
-
-        (r"(.{0,100})GreenGrid(.{0,180})", "GreenGrid", "RELATED_TO"),
-
-    ]
-
-    for pattern, project, relation in patterns:
-
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-
-            sentence = match.group(0).strip()
-
-            for name in entity_names:
-
-                if name != project and name.lower() in sentence.lower():
-
-                    add(name, project, relation, sentence)
-
-
-
+    # Preserve explicit role-based relations where the wording matches.
     role_patterns = [
-
-        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was|serves as)\s+(?:the\s+)?CEO\s+of\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "CEO_OF"),
-
-        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?managing director\s+of\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "MANAGING_DIRECTOR_OF"),
-
-        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?sustainability officer\s+at\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
-
-        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?research director\s+at\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
-
+        (r"([A-Z][A-Za-z.' ]{2,50})\\s+(?:is|was|serves as)\\s+(?:the\\s+)?CEO\\s+of\\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "CEO_OF"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\\s+(?:is|was)\\s+(?:the\\s+)?managing director\\s+of\\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "MANAGING_DIRECTOR_OF"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\\s+(?:is|was)\\s+(?:the\\s+)?sustainability officer\\s+at\\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\\s+(?:is|was)\\s+(?:the\\s+)?research director\\s+at\\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
     ]
 
     for pattern, relation in role_patterns:
-
         for match in re.finditer(pattern, text):
-
-            source_guess, target_guess = match.group(1).strip(), match.group(2).strip()
-
-            source = next((n for n in entity_names if n.lower() == source_guess.lower()), None)
-
-            target = next((n for n in entity_names if n.lower() == target_guess.lower()), None)
-
+            source_guess = re.sub(r"\\s+", " ", match.group(1)).strip()
+            target_guess = re.sub(r"\\s+", " ", match.group(2)).strip()
+            source = next((name for name in entity_names if name.casefold() == source_guess.casefold()), None)
+            target = next((name for name in entity_names if name.casefold() == target_guess.casefold()), None)
             if source and target:
-
                 add(source, target, relation, match.group(0))
 
+    # Split on punctuation AND line breaks. This handles PDFs where each
+    # sentence or bullet is extracted onto its own line.
+    segments = [
+        re.sub(r"\\s+", " ", part).strip()
+        for part in re.split(r"(?<=[.!?])\\s+|[\\r\\n]+", text)
+        if part.strip()
+    ]
 
+    # First link entities that occur together in the same sentence/bullet.
+    for segment in segments:
+        present = [
+            name for name in entity_names
+            if re.search(re.escape(name), segment, re.IGNORECASE)
+        ]
+        for i in range(len(present)):
+            for j in range(i + 1, len(present)):
+                add(present[i], present[j], "RELATED_TO", segment)
 
-    # Co-occurrence-based links are useful for the small demonstration corpus.
+    # PDF extraction sometimes splits a relationship across adjacent lines.
+    # Use a bounded context window as a fallback, with the actual text kept
+    # as evidence so the relationship remains inspectable.
+    occurrences = []
+    for name in entity_names:
+        for match in re.finditer(re.escape(name), text, re.IGNORECASE):
+            occurrences.append((match.start(), match.end(), name))
+    occurrences.sort(key=lambda item: item[0])
 
-    # They are labeled RELATED_TO, not asserted as a specific real-world relation.
-
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-
-        present = [name for name in entity_names if name.lower() in sentence.lower()]
-
-        if len(present) >= 2:
-
-            for index in range(len(present) - 1):
-
-                add(present[index], present[index + 1], "RELATED_TO", sentence)
-
-
+    for i, first in enumerate(occurrences):
+        for second in occurrences[i + 1:]:
+            if second[0] - first[1] > 350:
+                break
+            if first[2] == second[2]:
+                continue
+            evidence_start = max(0, first[0] - 100)
+            evidence_end = min(len(text), second[1] + 100)
+            evidence = text[evidence_start:evidence_end]
+            add(first[2], second[2], "RELATED_TO", evidence)
 
     return relationships
-
-
 
 
 
