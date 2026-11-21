@@ -1,59 +1,43 @@
-
+import math
 import os
 import re
 import uuid
 from pathlib import Path
+from typing import Optional
 
-import pymupdf
 import chromadb
-from sentence_transformers import SentenceTransformer
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel, Field
-from fastapi.middleware.cors import CORSMiddleware
-
+import pymupdf
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from google import genai
+from google.genai import types
+from neo4j import GraphDatabase
+from pydantic import BaseModel, Field
 
-
-# ----------------------------------
-# FILE STORAGE AND ENVIRONMENT
-# ----------------------------------
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 CHROMA_DIR = BASE_DIR / "chroma_db"
-CHROMA_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSIONS = 768
+CHROMA_COLLECTION_NAME = "document_chunks_gemini_v2"
 
 load_dotenv(BASE_DIR / ".env")
 
-
-# ----------------------------------
-# GOOGLE GEMINI CONFIGURATION
-# ----------------------------------
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-gemini_client = (
-    genai.Client(api_key=GEMINI_API_KEY)
-    if GEMINI_API_KEY else None
-)
-
-if gemini_client:
-    print("Gemini client initialized successfully!")
-else:
-    print("Gemini API key not found. Check backend/.env.")
-
-
-# ----------------------------------
-# NEO4J CONFIGURATION
-# ----------------------------------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
@@ -61,1559 +45,752 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
 neo4j_driver = None
-
 if NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD:
     try:
         neo4j_driver = GraphDatabase.driver(
             NEO4J_URI,
-            auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+            auth=(NEO4J_USERNAME, NEO4J_PASSWORD),
         )
-        print("Neo4j driver initialized successfully!")
-    except Exception as error:
-        print(f"Neo4j initialization failed: {error}")
-else:
-    print("Neo4j configuration is incomplete. Check backend/.env.")
+    except Exception as exc:
+        print(f"Neo4j driver initialization failed: {exc}")
 
-
-# ----------------------------------
-# INITIALIZE APPLICATION
-# ----------------------------------
+chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+chunks_collection = chroma_client.get_or_create_collection(
+    name=CHROMA_COLLECTION_NAME,
+    metadata={"hnsw:space": "cosine"},
+)
 
 app = FastAPI(
     title="GraphRAG Knowledge Explorer",
     description="AI-powered document and knowledge graph explorer",
-    version="3.4.0"
+    version="4.0.0",
 )
+
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+# Add your deployed Netlify URL as an environment variable on Render:
+# FRONTEND_URL=https://your-site.netlify.app
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url:
+    allowed_origins.append(frontend_url.rstrip("/"))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ----------------------------------
-# INITIALIZE CHROMADB
-# ----------------------------------
+# ------------------------------------------------------------
+# Request models
+# ------------------------------------------------------------
 
-chroma_client = chromadb.PersistentClient(
-    path=str(CHROMA_DIR)
-)
-
-collection = chroma_client.get_or_create_collection(
-    name="document_chunks",
-    metadata={
-        "description": "PDF document text chunks and embeddings"
-    }
-)
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=1000)
+    document_id: Optional[str] = None
+    top_k: int = Field(default=5, ge=1, le=10)
 
 
-# ----------------------------------
-# LOAD EMBEDDING MODEL
-# ----------------------------------
-
-embedding_model = None
-
-
-def get_embedding_model():
-    global embedding_model
-
-    if embedding_model is None:
-        print("Loading embedding model...")
-
-        embedding_model = SentenceTransformer(
-            "all-MiniLM-L6-v2"
-        )
-
-        print("Embedding model loaded successfully!")
-
-    return embedding_model
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=2, max_length=4000)
+    document_id: Optional[str] = None
+    top_k: int = Field(default=5, ge=1, le=10)
 
 
-# ----------------------------------
-# SHARED HELPERS
-# ----------------------------------
+# ------------------------------------------------------------
+# Common helpers
+# ------------------------------------------------------------
 
-def validate_document_id(document_id: str):
+def validate_document_id(document_id: str) -> str:
     try:
-        uuid.UUID(document_id)
-    except (ValueError, TypeError):
+        return str(uuid.UUID(document_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid document ID")
+
+
+def document_pdf_path(document_id: str) -> Path:
+    return UPLOAD_DIR / f"{document_id}.pdf"
+
+
+def document_text_path(document_id: str) -> Path:
+    return UPLOAD_DIR / f"{document_id}.txt"
+
+
+def normalize_vector(values):
+    vector = [float(value) for value in values]
+    magnitude = math.sqrt(sum(value * value for value in vector))
+    if magnitude == 0:
+        return vector
+    return [value / magnitude for value in vector]
+
+
+def require_gemini():
+    if gemini_client is None:
         raise HTTPException(
-            status_code=400,
-            detail="Invalid document ID."
+            status_code=503,
+            detail="Gemini API is not configured. Add GEMINI_API_KEY to the backend environment.",
         )
 
 
-def get_document_text(document_id: str) -> str:
-    validate_document_id(document_id)
+def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
+    """Create normalized Gemini embeddings in small batches."""
+    require_gemini()
+    vectors = []
+    batch_size = 50
 
-    text_path = UPLOAD_DIR / f"{document_id}.txt"
-
-    if not text_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Document text not found. Upload the PDF first."
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        response = gemini_client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=EMBEDDING_DIMENSIONS,
+            ),
         )
+        if not response.embeddings:
+            raise RuntimeError("Gemini returned no embeddings.")
+        vectors.extend(normalize_vector(item.values) for item in response.embeddings)
 
-    text = text_path.read_text(encoding="utf-8")
-
-    if not text.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="No readable text found in this PDF."
-        )
-
-    return text
+    if len(vectors) != len(texts):
+        raise RuntimeError("The number of embeddings did not match the number of texts.")
+    return vectors
 
 
-def extract_pdf_text(file_path):
+def extract_pdf_text(pdf_path: Path) -> tuple[str, int]:
     try:
-        with pymupdf.open(file_path) as document:
-            pages = []
-
-            for page_number, page in enumerate(document, start=1):
-                pages.append({
-                    "page": page_number,
-                    "text": page.get_text("text")
-                })
-
-            return {
-                "total_pages": len(document),
-                "pages": pages
-            }
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=422,
-            detail=f"PDF text extraction failed: {str(error)}"
-        )
+        with pymupdf.open(pdf_path) as pdf:
+            pages = [page.get_text("text") for page in pdf]
+            return "\n".join(pages).strip(), len(pdf)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}")
 
 
-def create_text_chunks(text, chunk_size=1200, overlap=200):
-    if not text.strip():
+def split_text_into_chunks(text: str) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
         return []
 
     chunks = []
     start = 0
-
     while start < len(text):
-        end = start + chunk_size
-
-        chunk = text[start:end].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
+        end = min(start + CHUNK_SIZE, len(text))
+        if end < len(text):
+            boundary = text.rfind(" ", start + int(CHUNK_SIZE * 0.7), end)
+            if boundary > start:
+                end = boundary
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
         if end >= len(text):
             break
-
-        start = end - overlap
-
+        start = max(end - CHUNK_OVERLAP, start + 1)
     return chunks
 
 
-# ----------------------------------
-# PROCESS AND STORE DOCUMENT CHUNKS
-# ----------------------------------
-
-def process_document_chunks(document_id: str, text: str = None):
-    """
-    Create text chunks, generate embeddings, and store them in ChromaDB.
-    """
-
-    if text is None:
-        text = get_document_text(document_id)
-
-    chunks = create_text_chunks(text)
-
-    if not chunks:
-        raise HTTPException(
-            status_code=422,
-            detail="Could not create text chunks from this document."
-        )
-
+def get_document_chunk_count(document_id: str) -> int:
     try:
-        model = get_embedding_model()
-
-        embeddings = model.encode(
-            chunks,
-            show_progress_bar=False
-        )
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Embedding generation failed: {str(error)}"
-        )
-
-    ids = [
-        f"{document_id}_chunk_{index}"
-        for index in range(len(chunks))
-    ]
-
-    metadatas = [
-        {
-            "document_id": document_id,
-            "chunk_index": index,
-            "total_chunks": len(chunks)
-        }
-        for index in range(len(chunks))
-    ]
-
-    try:
-        collection.delete(
-            where={"document_id": document_id}
-        )
-
-        collection.upsert(
-            ids=ids,
-            documents=chunks,
-            embeddings=embeddings.tolist(),
-            metadatas=metadatas
-        )
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"ChromaDB storage failed: {str(error)}"
-        )
-
-    print(
-        f"Document {document_id} processed successfully: "
-        f"{len(chunks)} chunks stored."
-    )
-
-    return len(chunks)
-
-
-def get_document_chunk_count(document_id: str):
-    try:
-        result = collection.get(
+        result = chunks_collection.get(
             where={"document_id": document_id},
-            include=[]
+            include=[],
         )
-
-        return len(result["ids"])
-
+        return len(result.get("ids", []))
     except Exception:
         return 0
 
 
-# ----------------------------------
-# ENTITY AND RELATIONSHIP EXTRACTION
-# ----------------------------------
+def process_document_chunks(document_id: str, text: str) -> int:
+    chunks = split_text_into_chunks(text)
+    if not chunks:
+        return 0
 
-KNOWN_ENTITIES = [
-    ("Northstar Analytics Pvt. Ltd.", "Organization"),
-    ("Northstar Analytics", "Organization"),
-    ("BluePeak University", "Organization"),
-    ("Meridian Devices Ltd.", "Organization"),
-    ("Meridian Devices", "Organization"),
-    ("City of Lakewood", "Organization"),
-    ("BluePeak University's Applied AI Laboratory", "Organization"),
-    ("Applied AI Laboratory", "Organization"),
-    ("Computer Science Department", "Department"),
-    ("Meera Kulkarni", "Person"),
-    ("Dr. Kabir Shah", "Person"),
-    ("Kabir Shah", "Person"),
-    ("Professor Asha Rao", "Person"),
-    ("Asha Rao", "Person"),
-    ("Rohan Iyer", "Person"),
-    ("Elena D'Souza", "Person"),
-    ("Nikhil Verma", "Person"),
-    ("Sara Fernandes", "Person"),
-    ("RiverWatch", "Project"),
-    ("GreenGrid", "Project"),
-    ("Pune", "Location"),
-    ("Maharashtra", "Location"),
-    ("Nagpur", "Location"),
-    ("Bengaluru", "Location"),
-    ("Karnataka", "Location"),
-    ("Aster River", "Location"),
-]
+    embeddings = embed_texts(chunks, "RETRIEVAL_DOCUMENT")
+    ids = [f"{document_id}_chunk_{index}" for index in range(len(chunks))]
+    metadatas = [
+        {
+            "document_id": document_id,
+            "chunk_index": index,
+            "total_chunks": len(chunks),
+        }
+        for index in range(len(chunks))
+    ]
+
+    # Replace this document's previous vectors in the new Gemini collection.
+    try:
+        chunks_collection.delete(where={"document_id": document_id})
+    except Exception:
+        pass
+
+    chunks_collection.add(
+        ids=ids,
+        documents=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+    return len(chunks)
 
 
-def _contains_name(text_lower: str, name: str) -> bool:
-    return re.search(
-        r"(?<!\w)" + re.escape(name.lower()) + r"(?!\w)",
-        text_lower
-    ) is not None
+def load_document_text(document_id: str) -> str:
+    path = document_text_path(document_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Document text was not found")
+    return path.read_text(encoding="utf-8")
 
 
-def extract_entities_and_relationships(text: str):
-    """Extract known entities and relationships from the test PDF."""
+# ------------------------------------------------------------
+# Rule-based entity and relationship extraction
+# ------------------------------------------------------------
 
-    text_lower = text.lower()
+KNOWN_ENTITIES = {
+    "Northstar Analytics Pvt. Ltd.": "Organization",
+    "BluePeak University": "Organization",
+    "Meridian Devices Ltd.": "Organization",
+    "City of Lakewood": "Organization",
+    "Applied AI Laboratory": "Organization",
+    "BluePeak University's Applied AI Laboratory": "Organization",
+    "Computer Science Department": "Organization",
+    "Meera Kulkarni": "Person",
+    "Dr Kabir Shah": "Person",
+    "Asha Rao": "Person",
+    "Rohan Iyer": "Person",
+    "Elena D'Souza": "Person",
+    "Nikhil Verma": "Person",
+    "Sara Fernandes": "Person",
+    "RiverWatch": "Project",
+    "GreenGrid": "Project",
+    "Pune": "Location",
+    "Maharashtra": "Location",
+    "Nagpur": "Location",
+    "Bengaluru": "Location",
+    "Karnataka": "Location",
+    "Aster River": "Location",
+}
 
+
+def extract_entities(text: str) -> list[dict]:
     found = []
+    lowered = text.lower()
+    for name, entity_type in KNOWN_ENTITIES.items():
+        if name.lower() in lowered:
+            found.append({"name": name, "type": entity_type})
+    return found
 
-    for name, entity_type in KNOWN_ENTITIES:
 
-        if _contains_name(text_lower, name):
-
-            if name == "Northstar Analytics":
-                if _contains_name(
-                    text_lower,
-                    "Northstar Analytics Pvt. Ltd."
-                ):
-                    remainder = text_lower.replace(
-                        "northstar analytics pvt. ltd.",
-                        ""
-                    )
-
-                    if not _contains_name(remainder, name):
-                        continue
-
-            if name == "Meridian Devices":
-                if _contains_name(
-                    text_lower,
-                    "Meridian Devices Ltd."
-                ):
-                    remainder = text_lower.replace(
-                        "meridian devices ltd.",
-                        ""
-                    )
-
-                    if not _contains_name(remainder, name):
-                        continue
-
-            if name == "Kabir Shah" and _contains_name(
-                text_lower, "Dr. Kabir Shah"
-            ):
-                continue
-
-            if name == "Asha Rao" and _contains_name(
-                text_lower, "Professor Asha Rao"
-            ):
-                continue
-
-            if name == "Applied AI Laboratory":
-                if _contains_name(
-                    text_lower,
-                    "BluePeak University's Applied AI Laboratory"
-                ):
-                    continue
-
-            found.append({
-                "name": name,
-                "type": entity_type
-            })
-
-    entities = []
-    canonical_seen = set()
-
-    aliases = {
-        "Northstar Analytics": "Northstar Analytics Pvt. Ltd.",
-        "Meridian Devices": "Meridian Devices Ltd.",
-        "Kabir Shah": "Dr. Kabir Shah",
-        "Professor Asha Rao": "Asha Rao",
-        "BluePeak University's Applied AI Laboratory":
-            "Applied AI Laboratory",
-    }
-
-    for entity in found:
-        name = aliases.get(entity["name"], entity["name"])
-
-        if name not in canonical_seen:
-            canonical_seen.add(name)
-
-            entities.append({
-                "name": name,
-                "type": entity["type"]
-            })
-
-    available = {
-        item["name"] for item in entities
-    }
-
+def extract_relationships(text: str, entities: list[dict]) -> list[dict]:
+    """Small, intentionally rule-based relationship extractor."""
     relationships = []
-    seen = set()
+    entity_names = [entity["name"] for entity in entities]
 
-    def add(source, relation, target, evidence_terms):
+    def add(source, target, relation, evidence):
+        if source in entity_names and target in entity_names:
+            item = {
+                "source": source,
+                "target": target,
+                "type": relation,
+                "evidence": evidence[:500],
+            }
+            if item not in relationships:
+                relationships.append(item)
 
-        if source not in available or target not in available:
-            return
+    patterns = [
+        (r"(.{0,100})RiverWatch(.{0,180})", "RiverWatch", "RELATED_TO"),
+        (r"(.{0,100})GreenGrid(.{0,180})", "GreenGrid", "RELATED_TO"),
+    ]
+    for pattern, project, relation in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            sentence = match.group(0).strip()
+            for name in entity_names:
+                if name != project and name.lower() in sentence.lower():
+                    add(name, project, relation, sentence)
 
-        key = (source, relation, target)
+    role_patterns = [
+        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was|serves as)\s+(?:the\s+)?CEO\s+of\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "CEO_OF"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?managing director\s+of\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "MANAGING_DIRECTOR_OF"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?sustainability officer\s+at\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
+        (r"([A-Z][A-Za-z.' ]{2,50})\s+(?:is|was)\s+(?:the\s+)?research director\s+at\s+([A-Z][A-Za-z0-9&.' ]{2,70})", "WORKS_AT"),
+    ]
+    for pattern, relation in role_patterns:
+        for match in re.finditer(pattern, text):
+            source_guess, target_guess = match.group(1).strip(), match.group(2).strip()
+            source = next((n for n in entity_names if n.lower() == source_guess.lower()), None)
+            target = next((n for n in entity_names if n.lower() == target_guess.lower()), None)
+            if source and target:
+                add(source, target, relation, match.group(0))
 
-        if key in seen:
-            return
+    # Co-occurrence-based links are useful for the small demonstration corpus.
+    # They are labeled RELATED_TO, not asserted as a specific real-world relation.
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        present = [name for name in entity_names if name.lower() in sentence.lower()]
+        if len(present) >= 2:
+            for index in range(len(present) - 1):
+                add(present[index], present[index + 1], "RELATED_TO", sentence)
 
-        evidence = " ".join(
-            line.strip()
-            for line in text.splitlines()
-            if any(
-                term.lower() in line.lower()
-                for term in evidence_terms
-            )
-        )
-
-        seen.add(key)
-
-        relationships.append({
-            "source": source,
-            "type": relation,
-            "target": target,
-            "evidence": (evidence or text[:300]).strip()[:1000]
-        })
-
-    has_riverwatch = "RiverWatch" in available
-    has_greengrid = "GreenGrid" in available
-    has_northstar = "Northstar Analytics Pvt. Ltd." in available
-    has_bluepeak = "BluePeak University" in available
-    has_meridian = "Meridian Devices Ltd." in available
-    has_city = "City of Lakewood" in available
-
-    # RiverWatch relationships
-
-    if has_northstar and has_riverwatch:
-        if re.search(
-            r"riverwatch.{0,220}founded by northstar|"
-            r"founded by northstar.{0,120}riverwatch",
-            text_lower
-        ):
-            add(
-                "Northstar Analytics Pvt. Ltd.",
-                "FOUNDED",
-                "RiverWatch",
-                ["RiverWatch", "founded"]
-            )
-
-    if "Nikhil Verma" in available and has_riverwatch:
-        if re.search(
-            r"managed by nikhil verma|"
-            r"nikhil verma manages riverwatch",
-            text_lower
-        ):
-            add(
-                "Nikhil Verma",
-                "MANAGES",
-                "RiverWatch",
-                ["Nikhil Verma", "manages"]
-            )
-
-    if has_city and has_riverwatch:
-        if re.search(
-            r"city of lakewood.{0,100}funds.{0,100}riverwatch|"
-            r"city of lakewood funds riverwatch",
-            text_lower
-        ):
-            add(
-                "City of Lakewood",
-                "FUNDS",
-                "RiverWatch",
-                ["City of Lakewood", "funds"]
-            )
-
-    if has_meridian and has_riverwatch:
-        if re.search(
-            r"meridian devices.{0,220}(suppl|deliver).{0,120}riverwatch|"
-            r"riverwatch.{0,220}meridian devices.{0,120}(suppl|deliver)",
-            text_lower
-        ):
-            add(
-                "Meridian Devices Ltd.",
-                "SUPPLIES",
-                "RiverWatch",
-                ["Meridian Devices", "RiverWatch"]
-            )
-
-    # GreenGrid relationships
-
-    if "Sara Fernandes" in available and has_greengrid:
-        if re.search(
-            r"led by sara fernandes|sara fernandes leads greengrid",
-            text_lower
-        ):
-            add(
-                "Sara Fernandes",
-                "LEADS",
-                "GreenGrid",
-                ["Sara Fernandes", "GreenGrid"]
-            )
-
-    if has_northstar and has_greengrid:
-        if re.search(
-            r"northstar analytics.{0,180}provides.{0,120}greengrid|"
-            r"provides.{0,120}forecasting software.{0,120}greengrid",
-            text_lower
-        ):
-            add(
-                "Northstar Analytics Pvt. Ltd.",
-                "PROVIDES_SOFTWARE_TO",
-                "GreenGrid",
-                ["Northstar Analytics", "GreenGrid"]
-            )
-
-    if has_meridian and has_greengrid:
-        if re.search(
-            r"meridian devices.{0,180}suppl.{0,120}greengrid|"
-            r"greengrid.{0,180}meridian devices.{0,120}suppl",
-            text_lower
-        ):
-            add(
-                "Meridian Devices Ltd.",
-                "SUPPLIES",
-                "GreenGrid",
-                ["Meridian Devices", "GreenGrid"]
-            )
-
-    # Organization collaboration
-
-    if has_northstar and has_bluepeak:
-        if re.search(
-            r"northstar analytics.{0,180}bluepeak university.{0,120}"
-            r"(collaborat|agreement)|"
-            r"bluepeak university.{0,180}northstar analytics.{0,120}"
-            r"(collaborat|agreement)",
-            text_lower
-        ):
-            add(
-                "Northstar Analytics Pvt. Ltd.",
-                "COLLABORATES_WITH",
-                "BluePeak University",
-                ["Northstar Analytics", "BluePeak University"]
-            )
-
-    if "Dr. Kabir Shah" in available and has_bluepeak:
-        if re.search(
-            r"kabir shah.{0,180}(collaborator|collaboration).{0,100}bluepeak|"
-            r"bluepeak.{0,180}kabir shah.{0,100}(collaborator|collaboration)",
-            text_lower
-        ):
-            add(
-                "Dr. Kabir Shah",
-                "COLLABORATES_WITH",
-                "BluePeak University",
-                ["Kabir Shah", "BluePeak University"]
-            )
-
-    if "Asha Rao" in available and has_bluepeak:
-        if re.search(
-            r"asha rao.{0,120}(chairs|chair|department chair).{0,120}bluepeak|"
-            r"bluepeak.{0,120}asha rao",
-            text_lower
-        ):
-            add(
-                "Asha Rao",
-                "CHAIRS_DEPARTMENT_AT",
-                "BluePeak University",
-                ["Asha Rao", "BluePeak University"]
-            )
-
-    if "Meera Kulkarni" in available and has_northstar:
-        if re.search(
-            r"meera kulkarni.{0,120}(ceo|chief executive officer).{0,120}northstar|"
-            r"chief executive officer.{0,120}meera kulkarni",
-            text_lower
-        ):
-            add(
-                "Meera Kulkarni",
-                "CEO_OF",
-                "Northstar Analytics Pvt. Ltd.",
-                ["Meera Kulkarni", "Chief Executive Officer"]
-            )
-
-    if "Rohan Iyer" in available and has_meridian:
-        if re.search(
-            r"rohan iyer.{0,120}(managing director).{0,120}meridian|"
-            r"managing director.{0,120}rohan iyer",
-            text_lower
-        ):
-            add(
-                "Rohan Iyer",
-                "MANAGING_DIRECTOR_OF",
-                "Meridian Devices Ltd.",
-                ["Rohan Iyer", "Managing Director"]
-            )
-
-    if "Elena D'Souza" in available and has_city:
-        if re.search(
-            r"elena d'souza.{0,120}sustainability officer.{0,120}"
-            r"city of lakewood|"
-            r"sustainability officer.{0,120}elena d'souza",
-            text_lower
-        ):
-            add(
-                "Elena D'Souza",
-                "OFFICER_OF",
-                "City of Lakewood",
-                ["Elena D'Souza", "Sustainability Officer"]
-            )
-
-    if "Dr. Kabir Shah" in available and has_northstar:
-        if re.search(
-            r"kabir shah.{0,120}research director.{0,120}northstar|"
-            r"research director.{0,120}kabir shah",
-            text_lower
-        ):
-            add(
-                "Dr. Kabir Shah",
-                "RESEARCH_DIRECTOR_AT",
-                "Northstar Analytics Pvt. Ltd.",
-                ["Kabir Shah", "Research Director"]
-            )
-
-    return entities, relationships
+    return relationships
 
 
-# ----------------------------------
-# STORE KNOWLEDGE GRAPH IN NEO4J
-# ----------------------------------
-
-def store_graph_in_neo4j(document_id: str, entities, relationships):
-
+def store_graph_in_neo4j(document_id: str, entities: list[dict], relationships: list[dict]):
     if neo4j_driver is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Neo4j is not configured. Check backend/.env."
-        )
+        raise HTTPException(status_code=503, detail="Neo4j is not configured")
 
-    with neo4j_driver.session(
-        database=NEO4J_DATABASE
-    ) as session:
-
+    with neo4j_driver.session(database=NEO4J_DATABASE) as session:
         session.run(
-            """
-            MATCH (e:Entity {document_id: $document_id})
-            DETACH DELETE e
-            """,
-            document_id=document_id
+            "MATCH (n:Entity {document_id: $document_id}) DETACH DELETE n",
+            document_id=document_id,
         )
-
         for entity in entities:
             session.run(
                 """
-                MERGE (e:Entity {
-                    name: $name,
-                    document_id: $document_id
-                })
-                SET e.type = $entity_type
+                MERGE (e:Entity {name: $name, document_id: $document_id})
+                SET e.type = $type
                 """,
                 name=entity["name"],
                 document_id=document_id,
-                entity_type=entity["type"]
+                type=entity["type"],
             )
-
-        for relationship in relationships:
+        for relation in relationships:
             session.run(
                 """
-                MATCH (source:Entity {
-                    name: $source,
-                    document_id: $document_id
-                })
-
-                MATCH (target:Entity {
-                    name: $target,
-                    document_id: $document_id
-                })
-
-                MERGE (source)-[r:RELATED_TO {
-                    type: $relationship_type,
-                    document_id: $document_id
-                }]->(target)
-
+                MATCH (a:Entity {name: $source, document_id: $document_id})
+                MATCH (b:Entity {name: $target, document_id: $document_id})
+                MERGE (a)-[r:RELATED_TO {type: $type, document_id: $document_id}]->(b)
                 SET r.evidence = $evidence
                 """,
-                source=relationship["source"],
-                target=relationship["target"],
+                source=relation["source"],
+                target=relation["target"],
                 document_id=document_id,
-                relationship_type=relationship["type"],
-                evidence=relationship["evidence"]
+                type=relation["type"],
+                evidence=relation.get("evidence", ""),
             )
 
 
-# ----------------------------------
-# HOME AND HEALTH APIs
-# ----------------------------------
+# ------------------------------------------------------------
+# Basic endpoints
+# ------------------------------------------------------------
 
 @app.get("/")
 def home():
     return {
         "success": True,
-        "message": "GraphRAG Backend is running!"
+        "message": "GraphRAG Knowledge Explorer API is running",
+        "version": "4.0.0",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "success": True,
+        "status": "healthy",
+        "gemini_configured": gemini_client is not None,
+        "neo4j_configured": neo4j_driver is not None,
+    }
 
-
-# ----------------------------------
-# NEO4J CONNECTION STATUS API
-# ----------------------------------
 
 @app.get("/api/neo4j/status")
 def neo4j_status():
-
     if neo4j_driver is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Neo4j is not configured. Check backend/.env."
-        )
-
-    try:
-        neo4j_driver.verify_connectivity()
-
-        with neo4j_driver.session(
-            database=NEO4J_DATABASE
-        ) as session:
-
-            test_value = session.run(
-                "RETURN 1 AS connection_test"
-            ).single()["connection_test"]
-
         return {
-            "success": True,
-            "message": "Successfully connected to Neo4j AuraDB!",
-            "connected": True,
-            "database": NEO4J_DATABASE,
-            "connection_test": test_value
+            "success": False,
+            "connected": False,
+            "message": "Neo4j environment variables are not configured",
+        }
+    try:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            result = session.run("RETURN 1 AS result").single()
+            return {
+                "success": True,
+                "connected": True,
+                "message": "Successfully connected to Neo4j AuraDB!",
+                "database": NEO4J_DATABASE,
+                "connection_test": result["result"],
+            }
+    except Exception as exc:
+        return {
+            "success": False,
+            "connected": False,
+            "message": f"Neo4j connection failed: {str(exc)}",
         }
 
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Neo4j connection failed: {str(error)}"
-        )
 
-
-# ----------------------------------
-# PDF UPLOAD API
-# ----------------------------------
+# ------------------------------------------------------------
+# PDF upload and document management
+# ------------------------------------------------------------
 
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
-
     if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed."
-        )
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    content = await file.read(MAX_FILE_SIZE + 1)
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Maximum file size is 20 MB")
+    if not contents:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
 
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Maximum PDF size is 20 MB."
-        )
+    document_id = str(uuid.uuid4())
+    pdf_path = document_pdf_path(document_id)
+    pdf_path.write_bytes(contents)
 
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid PDF file."
-        )
+    extracted_text, total_pages = extract_pdf_text(pdf_path)
+    if not extracted_text:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="No readable text was found in this PDF")
 
-    file_id = str(uuid.uuid4())
+    text_path = document_text_path(document_id)
+    text_path.write_text(extracted_text, encoding="utf-8")
 
-    file_path = UPLOAD_DIR / f"{file_id}.pdf"
-    text_path = UPLOAD_DIR / f"{file_id}.txt"
-
+    processing_message = "Text extracted. Embedding processing is pending."
+    processed_chunks = 0
     try:
-        file_path.write_bytes(content)
-
-        extraction_result = extract_pdf_text(file_path)
-
-        full_text = "\n".join(
-            page["text"]
-            for page in extraction_result["pages"]
-        )
-
-        text_path.write_text(
-            full_text,
-            encoding="utf-8"
-        )
-
-    except HTTPException:
-        file_path.unlink(missing_ok=True)
-        text_path.unlink(missing_ok=True)
-        raise
-
-    except OSError as error:
-        file_path.unlink(missing_ok=True)
-        text_path.unlink(missing_ok=True)
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not save document: {error}"
-        )
-
-    processing_success = False
-    total_chunks = 0
-    processing_error = None
-
-    try:
-        total_chunks = process_document_chunks(
-            file_id,
-            full_text
-        )
-
-        processing_success = True
-
-    except Exception as error:
-        processing_error = str(error)
-        print(
-            f"Automatic document processing failed: {processing_error}"
-        )
+        processed_chunks = process_document_chunks(document_id, extracted_text)
+        processing_message = "PDF uploaded, text extracted, and chunks embedded successfully."
+    except Exception as exc:
+        processing_message = f"PDF uploaded and text extracted; embedding processing failed: {exc}"
 
     return {
         "success": True,
-        "message": "PDF uploaded and text extracted successfully!",
+        "message": processing_message,
         "document": {
-            "id": file_id,
+            "document_id": document_id,
+            "id": document_id,
             "filename": file.filename,
-            "saved_as": file_path.name,
-            "size": len(content),
-            "total_pages": extraction_result["total_pages"],
-            "total_characters": len(full_text),
-            "extracted_text_preview": full_text[:2000],
-            "processed": processing_success,
-            "total_chunks": total_chunks,
-            "processing_error": processing_error
-        }
+            "total_pages": total_pages,
+            "total_characters": len(extracted_text),
+            "total_chunks": processed_chunks,
+            "processed": processed_chunks > 0,
+        },
     }
 
 
-# ----------------------------------
-# GET ALL DOCUMENTS API
-# ----------------------------------
-
 @app.get("/api/documents")
-def get_documents():
-
+def list_documents():
     documents = []
-
-    for file_path in UPLOAD_DIR.glob("*.pdf"):
-
-        file_id = file_path.stem
-
-        text_path = UPLOAD_DIR / f"{file_id}.txt"
-
-        extracted_text = (
-            text_path.read_text(encoding="utf-8")
-            if text_path.exists() else ""
-        )
-
+    for pdf_path in UPLOAD_DIR.glob("*.pdf"):
+        document_id = pdf_path.stem
+        text_path = document_text_path(document_id)
+        text = text_path.read_text(encoding="utf-8") if text_path.exists() else ""
         try:
-            with pymupdf.open(file_path) as pdf:
+            with pymupdf.open(pdf_path) as pdf:
                 total_pages = len(pdf)
-
         except Exception:
             total_pages = 0
 
-        total_chunks = get_document_chunk_count(file_id)
-
         documents.append({
-            "id": file_id,
-            "filename": file_path.name,
-            "size": file_path.stat().st_size,
+            "document_id": document_id,
+            "id": document_id,
+            "filename": pdf_path.name,
             "total_pages": total_pages,
-            "total_characters": len(extracted_text),
-            "processed": total_chunks > 0,
-            "total_chunks": total_chunks
+            "total_characters": len(text),
+            "total_chunks": get_document_chunk_count(document_id),
+            "processed": get_document_chunk_count(document_id) > 0,
         })
 
-    return {
-        "success": True,
-        "total_documents": len(documents),
-        "documents": documents
-    }
+    documents.sort(key=lambda item: item["filename"].lower())
+    return {"success": True, "total_documents": len(documents), "documents": documents}
 
-
-# ----------------------------------
-# DELETE DOCUMENT API
-# ----------------------------------
 
 @app.delete("/api/documents/{document_id}")
 def delete_document(document_id: str):
-
-    validate_document_id(document_id)
-
-    pdf_path = UPLOAD_DIR / f"{document_id}.pdf"
-    text_path = UPLOAD_DIR / f"{document_id}.txt"
-
-    pdf_exists = pdf_path.exists()
-    text_exists = text_path.exists()
-
-    # Find the number of chunks belonging to this document.
-    total_chunks = get_document_chunk_count(document_id)
-
-    deleted_graph_nodes = 0
-    neo4j_cleanup = False
+    document_id = validate_document_id(document_id)
 
     try:
-        # Delete this document's graph nodes and their relationships.
-        # Every graph node is tagged with its document_id.
-        if neo4j_driver is not None:
+        chunks_collection.delete(where={"document_id": document_id})
+    except Exception:
+        pass
 
-            with neo4j_driver.session(
-                database=NEO4J_DATABASE
-            ) as session:
-
-                result = session.run(
-                    """
-                    MATCH (e:Entity {document_id: $document_id})
-                    DETACH DELETE e
-                    """,
-                    document_id=document_id
+    if neo4j_driver is not None:
+        try:
+            with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                session.run(
+                    "MATCH (n:Entity {document_id: $document_id}) DETACH DELETE n",
+                    document_id=document_id,
                 )
+        except Exception as exc:
+            print(f"Could not remove graph data for {document_id}: {exc}")
 
-                summary = result.consume()
+    document_pdf_path(document_id).unlink(missing_ok=True)
+    document_text_path(document_id).unlink(missing_ok=True)
+    return {"success": True, "message": "Document deleted successfully", "document_id": document_id}
 
-                deleted_graph_nodes = (
-                    summary.counters.nodes_deleted
-                )
-
-                neo4j_cleanup = True
-
-        # Delete only this document's ChromaDB chunks.
-        if total_chunks > 0:
-            collection.delete(
-                where={"document_id": document_id}
-            )
-
-        # Delete the original PDF.
-        if pdf_path.exists():
-            pdf_path.unlink()
-
-        # Delete the extracted text file.
-        if text_path.exists():
-            text_path.unlink()
-
-        # If nothing belonging to this ID existed, return 404.
-        if (
-            not pdf_exists
-            and not text_exists
-            and total_chunks == 0
-            and deleted_graph_nodes == 0
-        ):
-            raise HTTPException(
-                status_code=404,
-                detail="Document not found."
-            )
-
-        print(
-            f"Document {document_id} deleted. "
-            f"Chunks: {total_chunks}, "
-            f"Graph nodes: {deleted_graph_nodes}"
-        )
-
-        return {
-            "success": True,
-            "message": "Document and its stored data deleted successfully.",
-            "document_id": document_id,
-            "deleted_chunks": total_chunks,
-            "deleted_graph_nodes": deleted_graph_nodes,
-            "deleted_pdf": pdf_exists,
-            "deleted_text": text_exists,
-            "neo4j_cleanup": neo4j_cleanup
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Document deletion failed: {str(error)}"
-        )
-
-
-# ----------------------------------
-# GET EXTRACTED TEXT API
-# ----------------------------------
 
 @app.get("/api/documents/{document_id}/text")
-def get_extracted_text(document_id: str):
+def get_document_text(document_id: str):
+    document_id = validate_document_id(document_id)
+    text = load_document_text(document_id)
+    return {"success": True, "document_id": document_id, "text": text}
 
-    extracted_text = get_document_text(document_id)
-
-    return {
-        "success": True,
-        "document_id": document_id,
-        "extracted_text": extracted_text,
-        "total_characters": len(extracted_text)
-    }
-
-
-# ----------------------------------
-# PROCESS DOCUMENT API
-# ----------------------------------
 
 @app.post("/api/documents/{document_id}/process")
 def process_document(document_id: str):
-
-    extracted_text = get_document_text(document_id)
-
-    total_chunks = process_document_chunks(
-        document_id,
-        extracted_text
-    )
-
+    document_id = validate_document_id(document_id)
+    text = load_document_text(document_id)
+    try:
+        count = process_document_chunks(document_id, text)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {exc}")
     return {
         "success": True,
-        "message": "Document processed successfully!",
+        "message": "Document processed successfully",
         "document_id": document_id,
-        "total_chunks": total_chunks,
-        "total_embeddings": total_chunks,
-        "storage": "ChromaDB"
+        "total_chunks": count,
+        "embedding_model": EMBEDDING_MODEL,
     }
 
 
-# ----------------------------------
-# GET DOCUMENT CHUNKS API
-# ----------------------------------
-
 @app.get("/api/documents/{document_id}/chunks")
 def get_document_chunks(document_id: str):
-
-    validate_document_id(document_id)
-
-    result = collection.get(
+    document_id = validate_document_id(document_id)
+    result = chunks_collection.get(
         where={"document_id": document_id},
-        include=["documents", "metadatas"]
+        include=["documents", "metadatas"],
     )
-
-    if not result["ids"]:
-        raise HTTPException(
-            status_code=404,
-            detail="No processed chunks found for this document."
-        )
-
-    chunks = []
-
-    for index, chunk_id in enumerate(result["ids"]):
-        chunks.append({
+    items = []
+    for index, chunk_id in enumerate(result.get("ids", [])):
+        items.append({
             "id": chunk_id,
             "text": result["documents"][index],
-            "metadata": result["metadatas"][index]
+            "metadata": result["metadatas"][index],
+        })
+    items.sort(key=lambda item: item["metadata"].get("chunk_index", 0))
+    return {
+        "success": True,
+        "document_id": document_id,
+        "total_chunks": len(items),
+        "chunks": items,
+    }
+
+
+# ------------------------------------------------------------
+# Semantic search and AI question answering
+# ------------------------------------------------------------
+
+@app.post("/api/knowledge/search")
+def semantic_search(request: SearchRequest):
+    query_vector = embed_texts([request.query], "RETRIEVAL_QUERY")[0]
+    where = {"document_id": request.document_id} if request.document_id else None
+
+    results = chunks_collection.query(
+        query_embeddings=[query_vector],
+        n_results=request.top_k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    matches = []
+    ids = results.get("ids", [[]])[0]
+    docs = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
+
+    for index, chunk_id in enumerate(ids):
+        matches.append({
+            "id": chunk_id,
+            "text": docs[index],
+            "document_id": metadatas[index].get("document_id"),
+            "chunk_index": metadatas[index].get("chunk_index"),
+            "distance": distances[index] if index < len(distances) else None,
         })
 
     return {
         "success": True,
-        "document_id": document_id,
-        "total_chunks": len(chunks),
-        "chunks": chunks
+        "query": request.query,
+        "total_results": len(matches),
+        "results": matches,
     }
 
 
-# ----------------------------------
-# SEMANTIC SEARCH REQUEST MODEL
-# ----------------------------------
-
-class SemanticSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=1000)
-    document_id: str | None = None
-    top_k: int = Field(default=5, ge=1, le=10)
-
-
-# ----------------------------------
-# SEMANTIC SEARCH API
-# ----------------------------------
-
-@app.post("/api/knowledge/search")
-def semantic_search(request: SemanticSearchRequest):
-
-    query_text = request.query.strip()
-
-    if len(query_text) < 2:
-        raise HTTPException(
-            status_code=422,
-            detail="Please enter a search question containing at least 2 characters."
-        )
-
-    filters = None
-
-    if request.document_id:
-        validate_document_id(request.document_id)
-        filters = {"document_id": request.document_id}
-
-    try:
-        if collection.count() == 0:
-            return {
-                "success": True,
-                "query": query_text,
-                "total_results": 0,
-                "message": "No processed document chunks are stored yet.",
-                "results": []
-            }
-
-        model = get_embedding_model()
-
-        query_embedding = model.encode(
-            [query_text],
-            show_progress_bar=False
-        )[0].tolist()
-
-        search_arguments = {
-            "query_embeddings": [query_embedding],
-            "n_results": request.top_k,
-            "include": [
-                "documents",
-                "metadatas",
-                "distances"
-            ]
-        }
-
-        if filters:
-            search_arguments["where"] = filters
-
-        search_result = collection.query(
-            **search_arguments
-        )
-
-        result_ids = search_result.get("ids", [[]])[0]
-        result_documents = search_result.get("documents", [[]])[0]
-        result_metadatas = search_result.get("metadatas", [[]])[0]
-        result_distances = search_result.get("distances", [[]])[0]
-
-        results = []
-
-        for index, chunk_id in enumerate(result_ids):
-
-            metadata = result_metadatas[index] or {}
-
-            results.append({
-                "chunk_id": chunk_id,
-                "document_id": metadata.get("document_id"),
-                "chunk_index": metadata.get("chunk_index"),
-                "text": result_documents[index],
-                "distance": result_distances[index]
-            })
-
-        return {
-            "success": True,
-            "query": query_text,
-            "total_results": len(results),
-            "search_type": "semantic",
-            "storage": "ChromaDB",
-            "embedding_model": "all-MiniLM-L6-v2",
-            "results": results
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Semantic search failed: {str(error)}"
-        )
-
-
-# ----------------------------------
-# GEMINI QUESTION-ANSWERING REQUEST MODEL
-# ----------------------------------
-
-class QuestionAnswerRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=1000)
-    document_id: str | None = None
-    top_k: int = Field(default=5, ge=1, le=10)
-
-
-# ----------------------------------
-# GEMINI QUESTION-ANSWERING API
-# ----------------------------------
-
 @app.post("/api/knowledge/ask")
-def ask_knowledge_base(request: QuestionAnswerRequest):
-
-    query_text = request.query.strip()
-
-    if len(query_text) < 2:
-        raise HTTPException(
-            status_code=422,
-            detail="Please enter a question containing at least 2 characters."
-        )
-
-    if gemini_client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini is not configured. Add GEMINI_API_KEY to backend/.env and restart the backend."
-        )
-
-    filters = None
+def ask_question(request: AskRequest):
+    require_gemini()
 
     if request.document_id:
-        validate_document_id(request.document_id)
-        filters = {"document_id": request.document_id}
+        document_id = validate_document_id(request.document_id)
+        if get_document_chunk_count(document_id) == 0:
+            text = load_document_text(document_id)
+            try:
+                process_document_chunks(document_id, text)
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Could not process document: {exc}")
 
-    try:
-        if collection.count() == 0 and not request.document_id:
-            return {
-                "success": True,
-                "query": query_text,
-                "answer": "No processed document information is available yet. Upload and process a PDF first.",
-                "total_sources": 0,
-                "sources": [],
-                "model": GEMINI_MODEL
-            }
+    query_vector = embed_texts([request.question], "RETRIEVAL_QUERY")[0]
+    where = {"document_id": request.document_id} if request.document_id else None
 
-        # ----------------------------------
-        # AUTOMATIC PROCESSING FALLBACK
-        # ----------------------------------
+    results = chunks_collection.query(
+        query_embeddings=[query_vector],
+        n_results=request.top_k,
+        where=where,
+        include=["documents", "metadatas", "distances"],
+    )
 
-        if request.document_id:
+    ids = results.get("ids", [[]])[0]
+    docs = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
 
-            existing_chunks = get_document_chunk_count(
-                request.document_id
-            )
-
-            if existing_chunks == 0:
-
-                print(
-                    "No ChromaDB chunks found for selected document. "
-                    "Processing it automatically..."
-                )
-
-                document_text = get_document_text(
-                    request.document_id
-                )
-
-                process_document_chunks(
-                    request.document_id,
-                    document_text
-                )
-
-        # ----------------------------------
-        # RETRIEVE RELEVANT CHUNKS
-        # ----------------------------------
-
-        if collection.count() == 0:
-            return {
-                "success": True,
-                "query": query_text,
-                "answer": "No processed document information is available yet.",
-                "total_sources": 0,
-                "sources": [],
-                "model": GEMINI_MODEL
-            }
-
-        model = get_embedding_model()
-
-        query_embedding = model.encode(
-            [query_text],
-            show_progress_bar=False
-        )[0].tolist()
-
-        search_arguments = {
-            "query_embeddings": [query_embedding],
-            "n_results": request.top_k,
-            "include": [
-                "documents",
-                "metadatas",
-                "distances"
-            ]
-        }
-
-        if filters:
-            search_arguments["where"] = filters
-
-        search_result = collection.query(
-            **search_arguments
+    if not docs:
+        raise HTTPException(
+            status_code=404,
+            detail="No processed document chunks were found. Upload and process a PDF first.",
         )
 
-        result_ids = search_result.get("ids", [[]])[0]
-        result_documents = search_result.get("documents", [[]])[0]
-        result_metadatas = search_result.get("metadatas", [[]])[0]
-        result_distances = search_result.get("distances", [[]])[0]
+    context_parts = []
+    sources = []
+    for index, chunk_text in enumerate(docs):
+        metadata = metadatas[index]
+        context_parts.append(f"[Source {index + 1}]\n{chunk_text}")
+        sources.append({
+            "id": ids[index],
+            "document_id": metadata.get("document_id"),
+            "chunk_index": metadata.get("chunk_index"),
+            "text": chunk_text,
+            "distance": distances[index] if index < len(distances) else None,
+        })
 
-        sources = []
-        context_parts = []
+    prompt = f"""You are the AI assistant in a document knowledge explorer.
+Answer the user's question using only the supplied document context.
+If the context does not contain the answer, clearly say that the documents do not provide enough information.
+Do not invent facts. Keep the answer clear and concise.
 
-        for index, chunk_id in enumerate(result_ids):
-
-            chunk_text = result_documents[index] or ""
-            metadata = result_metadatas[index] or {}
-
-            distance = (
-                result_distances[index]
-                if index < len(result_distances)
-                else None
-            )
-
-            chunk_index = metadata.get("chunk_index")
-
-            sources.append({
-                "chunk_id": chunk_id,
-                "document_id": metadata.get("document_id"),
-                "chunk_index": chunk_index,
-                "text": chunk_text,
-                "distance": distance
-            })
-
-            context_parts.append(
-                f"Source {index + 1} (chunk {chunk_index}):\n"
-                f"{chunk_text}"
-            )
-
-        if not context_parts:
-            return {
-                "success": True,
-                "query": query_text,
-                "answer": "I could not find relevant information in the selected document.",
-                "total_sources": 0,
-                "sources": [],
-                "model": GEMINI_MODEL
-            }
-
-        # ----------------------------------
-        # SEND CONTEXT TO GEMINI
-        # ----------------------------------
-
-        context = "\n\n---\n\n".join(context_parts)
-
-        prompt = f"""
-You are a helpful document question-answering assistant.
-
-Answer the user's question using only the information
-in the document excerpts below.
-
-Do not use outside knowledge or invent facts.
-
-If the excerpts do not contain enough information,
-clearly say that the document does not provide enough information.
-
-Write a concise, direct answer.
-
-You may combine facts from multiple excerpts when needed.
-
-DOCUMENT EXCERPTS:
-
-{context}
+DOCUMENT CONTEXT:
+{chr(10).join(context_parts)}
 
 USER QUESTION:
-
-{query_text}
-
-ANSWER:
+{request.question}
 """
 
-        gemini_response = gemini_client.models.generate_content(
+    try:
+        response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt
+            contents=prompt,
         )
+        answer = response.text or "I could not generate an answer from the available context."
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Gemini answer generation failed: {exc}")
 
-        answer_text = (
-            gemini_response.text or ""
-        ).strip()
+    return {
+        "success": True,
+        "question": request.question,
+        "answer": answer,
+        "sources": sources,
+        "model": GEMINI_MODEL,
+    }
 
-        if not answer_text:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini returned an empty answer. Please try again."
-            )
-
-        return {
-            "success": True,
-            "query": query_text,
-            "answer": answer_text,
-            "total_sources": len(sources),
-            "sources": sources,
-            "search_type": "semantic retrieval + Gemini generation",
-            "storage": "ChromaDB",
-            "embedding_model": "all-MiniLM-L6-v2",
-            "model": GEMINI_MODEL
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini question answering failed: {str(error)}"
-        )
-
-
-# ----------------------------------
-# CHROMADB STATUS API
-# ----------------------------------
 
 @app.get("/api/knowledge/status")
 def knowledge_status():
-
     return {
         "success": True,
-        "total_stored_chunks": collection.count(),
+        "total_stored_chunks": chunks_collection.count(),
         "storage": "ChromaDB",
-        "embedding_model": "all-MiniLM-L6-v2"
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "collection": CHROMA_COLLECTION_NAME,
     }
 
 
-# ----------------------------------
-# BUILD KNOWLEDGE GRAPH API
-# ----------------------------------
+# ------------------------------------------------------------
+# Knowledge graph endpoints
+# ------------------------------------------------------------
 
 @app.post("/api/documents/{document_id}/build-graph")
 def build_document_graph(document_id: str):
+    document_id = validate_document_id(document_id)
+    if neo4j_driver is None:
+        raise HTTPException(status_code=503, detail="Neo4j is not configured")
 
-    extracted_text = get_document_text(document_id)
+    text = load_document_text(document_id)
+    entities = extract_entities(text)
+    relationships = extract_relationships(text, entities)
 
-    entities, relationships = extract_entities_and_relationships(
-        extracted_text
-    )
-
-    if not entities:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No entities were detected. Check that the PDF "
-                "contains selectable text."
-            )
-        )
-
-    store_graph_in_neo4j(
-        document_id,
-        entities,
-        relationships
-    )
+    try:
+        store_graph_in_neo4j(document_id, entities, relationships)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save graph to Neo4j: {exc}")
 
     return {
         "success": True,
-        "message": "Knowledge graph created and stored in Neo4j.",
+        "message": "Knowledge graph built successfully",
         "document_id": document_id,
         "total_entities": len(entities),
         "total_relationships": len(relationships),
         "entities": entities,
         "relationships": relationships,
-        "extraction_method": (
-            "controlled entity dictionary and "
-            "rule-based relationship patterns"
-        )
     }
 
 
-# ----------------------------------
-# GET KNOWLEDGE GRAPH API
-# ----------------------------------
-
 @app.get("/api/knowledge/graph")
-def get_knowledge_graph(document_id: str = None):
-
+def get_knowledge_graph(document_id: Optional[str] = None):
     if neo4j_driver is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Neo4j is not configured."
-        )
+        raise HTTPException(status_code=503, detail="Neo4j is not configured")
 
+    query = """
+    MATCH (a:Entity)
+    WHERE $document_id IS NULL OR a.document_id = $document_id
+    OPTIONAL MATCH (a)-[r:RELATED_TO]->(b:Entity)
+    WHERE b IS NULL OR ($document_id IS NULL OR b.document_id = $document_id)
+    RETURN a.name AS source, a.type AS source_type,
+           a.document_id AS document_id,
+           type(r) AS relationship,
+           r.type AS relationship_type,
+           r.evidence AS evidence,
+           b.name AS target, b.type AS target_type
+    """
     try:
-        with neo4j_driver.session(
-            database=NEO4J_DATABASE
-        ) as session:
+        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+            records = list(session.run(query, document_id=document_id))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not retrieve graph: {exc}")
 
-            if document_id:
+    nodes_by_name = {}
+    edges = []
+    for record in records:
+        source = record["source"]
+        if source:
+            nodes_by_name[source] = {
+                "id": source,
+                "label": source,
+                "name": source,
+                "type": record["source_type"] or "Entity",
+                "document_id": record["document_id"],
+            }
+        target = record["target"]
+        if target:
+            nodes_by_name[target] = {
+                "id": target,
+                "label": target,
+                "name": target,
+                "type": record["target_type"] or "Entity",
+                "document_id": record["document_id"],
+            }
+            edges.append({
+                "id": f"{source}-{target}-{len(edges)}",
+                "source": source,
+                "target": target,
+                "label": record["relationship_type"] or "RELATED_TO",
+                "type": record["relationship_type"] or "RELATED_TO",
+                "evidence": record["evidence"] or "",
+            })
 
-                validate_document_id(document_id)
-
-                result = session.run(
-                    """
-                    MATCH (source:Entity {
-                        document_id: $document_id
-                    })
-
-                    OPTIONAL MATCH
-                    (source)-[r:RELATED_TO {
-                        document_id: $document_id
-                    }]->(target:Entity)
-
-                    RETURN source.name AS source_name,
-                           source.type AS source_type,
-                           target.name AS target_name,
-                           target.type AS target_type,
-                           r.type AS relationship_type
-                    """,
-                    document_id=document_id
-                )
-
-            else:
-
-                result = session.run(
-                    """
-                    MATCH (source:Entity)
-
-                    OPTIONAL MATCH
-                    (source)-[r:RELATED_TO]->(target:Entity)
-
-                    RETURN source.name AS source_name,
-                           source.type AS source_type,
-                           target.name AS target_name,
-                           target.type AS target_type,
-                           r.type AS relationship_type
-
-                    LIMIT 1000
-                    """
-                )
-
-            nodes = {}
-            edges = []
-            seen_edges = set()
-
-            for record in result:
-
-                source_name = record["source_name"]
-
-                nodes[source_name] = {
-                    "id": source_name,
-                    "name": source_name,
-                    "type": record["source_type"] or "Entity"
-                }
-
-                target_name = record["target_name"]
-
-                if target_name:
-
-                    nodes[target_name] = {
-                        "id": target_name,
-                        "name": target_name,
-                        "type": record["target_type"] or "Entity"
-                    }
-
-                    edge_key = (
-                        source_name,
-                        record["relationship_type"],
-                        target_name
-                    )
-
-                    if edge_key not in seen_edges:
-
-                        seen_edges.add(edge_key)
-
-                        edges.append({
-                            "source": source_name,
-                            "target": target_name,
-                            "type": record["relationship_type"]
-                        })
-
-        return {
-            "success": True,
-            "total_nodes": len(nodes),
-            "total_relationships": len(edges),
-            "nodes": list(nodes.values()),
-            "relationships": edges
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not retrieve knowledge graph: {str(error)}"
-        )
+    nodes = list(nodes_by_name.values())
+    return {
+        "success": True,
+        "document_id": document_id,
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "nodes": nodes,
+        "edges": edges,
+    }
 
 
-# ----------------------------------
-# SHUTDOWN: CLOSE NEO4J CONNECTION
-# ----------------------------------
+# ------------------------------------------------------------
+# Shutdown
+# ------------------------------------------------------------
 
 @app.on_event("shutdown")
-def close_neo4j_connection():
-
+def shutdown_event():
     if neo4j_driver is not None:
         neo4j_driver.close()
-        print("Neo4j connection closed.")
