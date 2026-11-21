@@ -37,7 +37,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import "./App.css";
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = "https://graphrag-project.onrender.com";
 
 const ENTITY_COLORS = {
   Person: "#a78bfa",
